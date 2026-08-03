@@ -1,171 +1,216 @@
-"""
-allocation.py
-==============
-Pure rule-based substitution engine. No AI/LLM is used here - this is
-deterministic logic so results are consistent and explainable, which
-matters for something staff will be held to.
+"""Substitution allocation, history persistence, and report exports."""
 
-Rules implemented (as specified):
-1. HOD is NEVER assigned a substitution.
-2. Any staff marked "restricted" (in timetable_data.py, or added for a
-   single run via the app) is NEVER assigned a substitution.
-3. A staff member on leave is obviously never assigned a substitution.
-4. PRIORITY 1: Among staff who are free at that exact period AND already
-   teach the SAME year/class on that day order, prefer them - but only
-   if adding this period does not create more than MAX_CONTINUOUS_HOURS
-   back-to-back periods for them (counting original classes + already
-   assigned substitutions this run).
-5. PRIORITY 2 (fallback): Among ALL eligible free staff (regardless of
-   subject/year match), prefer whoever has the LEAST total workload that
-   day - again respecting the continuous-hours cap.
-6. If nobody qualifies, the period is reported as UNRESOLVED so the
-   department can handle it manually (the app makes this obvious rather
-   than silently failing).
+from __future__ import annotations
 
-Within each priority group, ties are broken by choosing the substitute
-with the lowest workload that day, so load stays balanced.
-"""
+import csv
+import hashlib
+from collections import Counter
+from datetime import date, datetime, timedelta
+from io import BytesIO, StringIO
+from pathlib import Path
+from typing import Any, Iterable
 
-from timetable_data import TIMETABLE, STAFF_INFO, PERIODS, MAX_CONTINUOUS_HOURS
+import pandas as pd
 
 
-def get_period_info(staff, day_order, period):
-    return TIMETABLE.get(staff, {}).get(day_order, {}).get(period)
+HISTORY_COLUMNS = [
+    "allocation_id", "date", "day_order", "period", "class_year", "subject",
+    "absent_staff", "assigned_staff", "same_class_priority", "daily_load_before",
+    "daily_load_after", "weekly_extra_before", "monthly_extra_before", "reason",
+    "saved_at",
+]
 
 
-def is_free(staff, day_order, period):
-    return get_period_info(staff, day_order, period) is None
+def _lesson(timetable: dict, staff: str, day_order: str, period: int) -> Any:
+    return timetable.get(staff, {}).get(day_order, {}).get(period)
 
 
-def day_workload(staff, day_order, extra_assignments):
-    """Count of periods staff is teaching that day, including substitutions
-    already assigned to them earlier in this same run."""
-    day = TIMETABLE.get(staff, {}).get(day_order, {})
-    base = sum(1 for p in PERIODS if day.get(p) is not None)
-    extra = sum(1 for (s, d, p) in extra_assignments if s == staff and d == day_order)
-    return base + extra
+def _daily_base_load(timetable: dict, staff: str, day_order: str) -> int:
+    return sum(value is not None for value in timetable.get(staff, {}).get(day_order, {}).values())
 
 
-def busy_periods(staff, day_order, extra_assignments):
-    day = TIMETABLE.get(staff, {}).get(day_order, {})
-    busy = set(p for p in PERIODS if day.get(p) is not None)
-    for (s, d, p) in extra_assignments:
-        if s == staff and d == day_order:
-            busy.add(p)
-    return busy
+def _teaches_class(timetable: dict, staff: str, class_year: str) -> bool:
+    return any(
+        lesson and lesson.get("year") == class_year
+        for day in timetable.get(staff, {}).values()
+        for lesson in day.values()
+    )
 
 
-def max_consecutive_run(periods_set):
-    if not periods_set:
-        return 0
-    ordered = sorted(periods_set)
-    max_run = cur_run = 1
-    for i in range(1, len(ordered)):
-        if ordered[i] == ordered[i - 1] + 1:
-            cur_run += 1
-            max_run = max(max_run, cur_run)
-        else:
-            cur_run = 1
-    return max_run
+def _history_counts(history: pd.DataFrame, professor: str, selected_date: date) -> tuple[int, int]:
+    if history.empty:
+        return 0, 0
+    dates = pd.to_datetime(history["date"], errors="coerce").dt.date
+    assigned = history["assigned_staff"].eq(professor)
+    week_start = selected_date - timedelta(days=selected_date.weekday())
+    week_end = week_start + timedelta(days=6)
+    weekly = int((assigned & dates.between(week_start, week_end)).sum())
+    monthly = int((assigned & dates.map(lambda d: bool(d) and d.year == selected_date.year and d.month == selected_date.month)).sum())
+    return weekly, monthly
 
 
-def violates_continuous_limit(staff, day_order, period, extra_assignments):
-    busy = busy_periods(staff, day_order, extra_assignments)
-    busy_with_new = busy | {period}
-    return max_consecutive_run(busy_with_new) > MAX_CONTINUOUS_HOURS
-
-
-def teaches_same_year_that_day(staff, day_order, year):
-    day = TIMETABLE.get(staff, {}).get(day_order, {})
-    return any(info is not None and info.get("year") == year for info in day.values())
-
-
-def build_excluded_set(on_leave_list, extra_restricted):
-    hod_staff = {s for s, info in STAFF_INFO.items() if info.get("is_hod")}
-    default_restricted = {s for s, info in STAFF_INFO.items() if info.get("restricted")}
-    excluded = hod_staff | default_restricted | set(extra_restricted) | set(on_leave_list)
-    return excluded, hod_staff, default_restricted
-
-
-def find_substitute(day_order, period, class_info, excluded, extra_assignments):
-    year = class_info.get("year")
-
-    # ---- Priority 1: same-year staff, free now, within continuous cap ----
-    p1_candidates = []
-    for staff in TIMETABLE:
-        if staff in excluded:
+def _co_teacher_present(
+    timetable: dict, absent_staff: set[str], day_order: str, period: int, lesson: dict
+) -> str | None:
+    for staff in timetable:
+        if staff in absent_staff:
             continue
-        if not is_free(staff, day_order, period):
-            continue
-        if not teaches_same_year_that_day(staff, day_order, year):
-            continue
-        if violates_continuous_limit(staff, day_order, period, extra_assignments):
-            continue
-        p1_candidates.append(staff)
-
-    if p1_candidates:
-        chosen = min(p1_candidates, key=lambda s: day_workload(s, day_order, extra_assignments))
-        return chosen, "Priority 1: teaches same year/class that day"
-
-    # ---- Priority 2: least-workload free staff, within continuous cap ----
-    p2_candidates = []
-    for staff in TIMETABLE:
-        if staff in excluded:
-            continue
-        if not is_free(staff, day_order, period):
-            continue
-        if violates_continuous_limit(staff, day_order, period, extra_assignments):
-            continue
-        p2_candidates.append(staff)
-
-    if p2_candidates:
-        chosen = min(p2_candidates, key=lambda s: day_workload(s, day_order, extra_assignments))
-        return chosen, "Priority 2: least workload that day"
-
-    return None, "No eligible substitute found - manual intervention required"
+        other = _lesson(timetable, staff, day_order, period)
+        if other and other.get("subject") == lesson.get("subject") and other.get("year") == lesson.get("year"):
+            return staff
+    return None
 
 
-def generate_substitution_plan(on_leave_list, day_order, extra_restricted=None):
-    """
-    Returns a list of dicts, one per class-hour that needs covering:
-    {
-        "leave_staff": str,
-        "period": int,
-        "subject": str,
-        "year": str,
-        "substitute": str or None,
-        "reason": str,
-    }
-    Also returns the excluded-staff breakdown so the UI can explain itself.
-    """
-    extra_restricted = extra_restricted or []
-    excluded, hod_staff, default_restricted = build_excluded_set(on_leave_list, extra_restricted)
+def generate_substitution_plan(
+    timetable: dict,
+    selected_date: date,
+    day_order: str,
+    absent_staff: Iterable[str],
+    history: pd.DataFrame | None = None,
+    hod: str | None = None,
+    restricted_staff: Iterable[str] = (),
+    max_daily_periods: int = 3,
+) -> pd.DataFrame:
+    """Generate a deterministic plan that applies every requested allocation rule."""
+    history = history if history is not None else pd.DataFrame(columns=HISTORY_COLUMNS)
+    absent = set(absent_staff)
+    excluded = absent | set(restricted_staff)
+    if hod:
+        excluded.add(hod)
+    assigned_today: Counter[str] = Counter()
+    rows: list[dict[str, Any]] = []
 
-    extra_assignments = {}  # (substitute, day_order, period) -> True
-    plan = []
+    for missing in sorted(absent):
+        for period, lesson in sorted(timetable.get(missing, {}).get(day_order, {}).items()):
+            if not lesson:
+                continue
+            co_teacher = _co_teacher_present(timetable, absent, day_order, period, lesson)
+            if co_teacher:
+                rows.append({
+                    "date": selected_date.isoformat(), "day_order": day_order, "period": period,
+                    "class_year": lesson.get("year", ""), "subject": lesson.get("subject", ""),
+                    "absent_staff": missing, "assigned_staff": "", "status": "Skipped – co-teacher present",
+                    "same_class_priority": False, "daily_load_before": "", "daily_load_after": "",
+                    "weekly_extra_before": "", "monthly_extra_before": "",
+                    "reason": f"No substitute required; {co_teacher} is already scheduled for this shared class.",
+                })
+                continue
 
-    # Period-major order: fill period 1 for everyone on leave first, then
-    # period 2, etc. This spreads substitutions more fairly than doing
-    # one absent staff member's whole day at a time.
-    for period in PERIODS:
-        for leave_staff in on_leave_list:
-            class_info = get_period_info(leave_staff, day_order, period)
-            if class_info is None:
-                continue  # they had no class that period anyway
+            candidates = []
+            for candidate in timetable:
+                if candidate in excluded or _lesson(timetable, candidate, day_order, period) is not None:
+                    continue
+                daily_load = _daily_base_load(timetable, candidate, day_order) + assigned_today[candidate]
+                if daily_load >= max_daily_periods:
+                    continue
+                weekly, monthly = _history_counts(history, candidate, selected_date)
+                same_class = _teaches_class(timetable, candidate, lesson.get("year", ""))
+                # Exact order implements: same class first, then today's load, then
+                # weekly and monthly fairness, with name as a stable final tie-break.
+                candidates.append(((not same_class, daily_load, weekly, monthly, candidate.casefold()),
+                                   candidate, same_class, daily_load, weekly, monthly))
 
-            substitute, reason = find_substitute(day_order, period, class_info, excluded, extra_assignments)
-            if substitute:
-                extra_assignments[(substitute, day_order, period)] = True
+            if not candidates:
+                rows.append({
+                    "date": selected_date.isoformat(), "day_order": day_order, "period": period,
+                    "class_year": lesson.get("year", ""), "subject": lesson.get("subject", ""),
+                    "absent_staff": missing, "assigned_staff": "", "status": "Unassigned",
+                    "same_class_priority": False, "daily_load_before": "", "daily_load_after": "",
+                    "weekly_extra_before": "", "monthly_extra_before": "",
+                    "reason": f"No eligible free professor can remain within the {max_daily_periods}-period daily cap.",
+                })
+                continue
 
-            plan.append({
-                "leave_staff": leave_staff,
-                "period": period,
-                "subject": class_info.get("subject"),
-                "year": class_info.get("year"),
-                "substitute": substitute,
-                "reason": reason,
+            _, chosen, same_class, daily_load, weekly, monthly = min(candidates, key=lambda item: item[0])
+            assigned_today[chosen] += 1
+            rows.append({
+                "date": selected_date.isoformat(), "day_order": day_order, "period": period,
+                "class_year": lesson.get("year", ""), "subject": lesson.get("subject", ""),
+                "absent_staff": missing, "assigned_staff": chosen, "status": "Proposed",
+                "same_class_priority": same_class, "daily_load_before": daily_load,
+                "daily_load_after": daily_load + 1, "weekly_extra_before": weekly,
+                "monthly_extra_before": monthly,
+                "reason": (
+                    ("Same-class professor; " if same_class else "Free professor; ")
+                    + f"daily load {daily_load}→{daily_load + 1}, weekly extras {weekly}, monthly extras {monthly}."
+                ),
             })
+    return pd.DataFrame(rows)
 
-    # keep output sorted by period then leave_staff for readability
-    plan.sort(key=lambda r: (r["period"], r["leave_staff"]))
-    return plan, {"hod": hod_staff, "default_restricted": default_restricted, "extra_restricted": set(extra_restricted)}
+
+class HistoryStore:
+    """Small CSV-backed history store suitable for local and Streamlit use."""
+
+    def __init__(self, path: str | Path = "allocation_history.csv") -> None:
+        self.path = Path(path)
+
+    def load(self) -> pd.DataFrame:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return pd.DataFrame(columns=HISTORY_COLUMNS)
+        frame = pd.read_csv(self.path, dtype=str).fillna("")
+        for column in HISTORY_COLUMNS:
+            if column not in frame:
+                frame[column] = ""
+        return frame[HISTORY_COLUMNS]
+
+    def save_confirmed(self, plan: pd.DataFrame) -> int:
+        if plan.empty:
+            return 0
+        confirmed = plan[(plan["status"].eq("Proposed")) & plan["assigned_staff"].ne("")].copy()
+        if confirmed.empty:
+            return 0
+        existing = self.load()
+        existing_ids = set(existing["allocation_id"])
+        saved_at = datetime.now().isoformat(timespec="seconds")
+        records = []
+        for row in confirmed.to_dict("records"):
+            natural_key = "|".join(str(row.get(key, "")) for key in
+                                   ("date", "day_order", "period", "absent_staff", "subject", "assigned_staff"))
+            allocation_id = hashlib.sha256(natural_key.encode()).hexdigest()[:16]
+            if allocation_id in existing_ids:
+                continue
+            record = {column: row.get(column, "") for column in HISTORY_COLUMNS}
+            record.update({"allocation_id": allocation_id, "saved_at": saved_at})
+            records.append(record)
+            existing_ids.add(allocation_id)
+        if not records:
+            return 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not self.path.exists() or self.path.stat().st_size == 0
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=HISTORY_COLUMNS)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(records)
+        return len(records)
+
+
+def monthly_report(history: pd.DataFrame, staff: Iterable[str], year: int, month: int) -> pd.DataFrame:
+    report_staff = list(staff)
+    if history.empty:
+        counts = Counter()
+    else:
+        dates = pd.to_datetime(history["date"], errors="coerce")
+        mask = dates.dt.year.eq(year) & dates.dt.month.eq(month)
+        counts = Counter(history.loc[mask, "assigned_staff"])
+    result = pd.DataFrame({"Professor": report_staff, "Extra classes": [counts[name] for name in report_staff]})
+    return result.sort_values(["Extra classes", "Professor"], kind="stable").reset_index(drop=True)
+
+
+def dataframe_csv_bytes(frame: pd.DataFrame) -> bytes:
+    buffer = StringIO()
+    frame.to_csv(buffer, index=False)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def dataframe_excel_bytes(frame: pd.DataFrame, sheet_name: str = "Report") -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        sheet = writer.book[sheet_name[:31]]
+        sheet.freeze_panes = "A2"
+        for column in sheet.columns:
+            width = min(max(len(str(cell.value or "")) for cell in column) + 2, 60)
+            sheet.column_dimensions[column[0].column_letter].width = width
+    return buffer.getvalue()
+
